@@ -2,13 +2,21 @@ package org.behappy.porcupine.check;
 
 import org.behappy.porcupine.model.CallEvent;
 import org.behappy.porcupine.model.Event;
+import org.behappy.porcupine.model.Model;
 import org.behappy.porcupine.model.Operation;
+import org.behappy.porcupine.model.Pair;
 import org.behappy.porcupine.model.ReturnEvent;
 
 import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.behappy.porcupine.check.CacheEntry.cacheContains;
 
 public record Entry<T>(
         EntryKind kind,
@@ -54,5 +62,87 @@ public record Entry<T>(
             root = entry.insertBefore(root);
         }
         return root;
+    }
+
+
+    public static <S, I, O, T> Pair<Boolean, List<List<Integer>>> checkSingle(
+            Model<S, I, O, T> model,
+            List<Entry<T>> history,
+            boolean computePartial,
+            AtomicInteger kill
+    ) {
+        var entry = makeLinkedEntries(history);
+        int n = entry.length() / 2;
+        var linearized = new BitSet(n);
+        Map<Integer, List<CacheEntry<S>>> cache = new HashMap<>();
+        List<CallsEntry<T, S>> calls = new ArrayList<>();
+        List<List<Integer>> longest = new ArrayList<>(Collections.nCopies(n, null));
+
+        S state = model.init();
+        var headEntry = entry.insertBefore(new Node<>(null, null, -1));
+
+        while (headEntry.next != null) {
+            if (kill.get() != 0) {
+                return Pair.of(false, longest);
+            }
+            if (entry.match != null) {
+                var matching = entry.match;
+                Pair<Boolean, S> stepResult = model.step(state, entry.value, matching.value);
+                boolean ok = stepResult.first();
+                S newState = stepResult.second();
+                if (ok) {
+                    BitSet newLinearized = (BitSet) linearized.clone();
+                    newLinearized.set(entry.id);
+                    CacheEntry<S> newCacheEntry = new CacheEntry<>(newLinearized, newState);
+                    if (!cacheContains(model, cache, newCacheEntry)) {
+                        var hash = newLinearized.hashCode();
+                        cache.computeIfAbsent(hash, k -> new ArrayList<>()).add(newCacheEntry);
+                        calls.add(new CallsEntry<>(entry, state));
+                        state = newState;
+                        linearized.set(entry.id);
+                        entry.lift();
+                        entry = headEntry.next;
+                    } else {
+                        entry = entry.next;
+                    }
+                } else {
+                    entry = entry.next;
+                }
+            } else {
+                if (calls.isEmpty()) {
+                    return Pair.of(false, longest);
+                }
+                if (computePartial) {
+                    int callsLen = calls.size();
+                    List<Integer> seq = null;
+                    for (var v : calls) {
+                        if (longest.get(v.entry().id) == null || callsLen > longest.get(v.entry().id).size()) {
+                            if (seq == null) {
+                                seq = new ArrayList<>();
+                                for (var vv : calls) {
+                                    seq.add(vv.entry().id);
+                                }
+                            }
+                            longest.set(v.entry().id, seq);
+                        }
+                    }
+                }
+                var callsTop = calls.get(calls.size() - 1);
+                entry = callsTop.entry;
+                state = callsTop.state;
+                linearized.clear(entry.id);
+                calls.remove(calls.size() - 1);
+                entry.unlift();
+                entry = entry.next;
+            }
+        }
+        List<Integer> seq = new ArrayList<>();
+        for (var v : calls) {
+            seq.add(v.entry().id);
+        }
+        for (int i = 0; i < n; i++) {
+            longest.set(i, seq);
+        }
+        return Pair.of(true, longest);
     }
 }
